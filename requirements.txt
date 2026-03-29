@@ -24,10 +24,10 @@ psycopg2-binary>=2.9          # PostgreSQL
 sqlalchemy>=2.0
 
 # NLP — real semantic embeddings (replaces random projections)
-#sentence-transformers>=2.7    # all-MiniLM-L6-v2 etc.
-#vaderSentiment>=3.3           # fast rule-based sentiment (finance-tuned)
-#transformers>=4.39            # HuggingFace base (required by sentence-transformers)
-#torch>=2.2.0                  # CPU build; use torch+cu121 wheels for GPU
+sentence-transformers>=2.7    # all-MiniLM-L6-v2 etc.
+vaderSentiment>=3.3           # fast rule-based sentiment (finance-tuned)
+transformers>=4.39            # HuggingFace base (required by sentence-transformers)
+torch>=2.2.0                  # CPU build; use torch+cu121 wheels for GPU
 
 # Vector DB
 faiss-cpu>=1.8                # swap to faiss-gpu for CUDA
