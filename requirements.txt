@@ -1,0 +1,47 @@
+# ── GMMIE — requirements.txt ──────────────────────────────────────────────────
+
+# Core numerics
+numpy>=1.26
+scipy>=1.12
+
+# Async / networking
+aiohttp>=3.9
+websockets>=12.0
+
+# API server
+fastapi>=0.110
+uvicorn[standard]>=0.27
+
+# Market data WebSocket
+pyzmq>=25.1                   # ZeroMQ (optional direct broker feed)
+
+# Messaging & cache
+redis[asyncio]>=5.0
+pyarrow>=15.0                 # fast in-memory format (normalization layer)
+
+# Storage
+psycopg2-binary>=2.9          # PostgreSQL
+sqlalchemy>=2.0
+
+# NLP — real semantic embeddings (replaces random projections)
+sentence-transformers>=2.7    # all-MiniLM-L6-v2 etc.
+vaderSentiment>=3.3           # fast rule-based sentiment (finance-tuned)
+transformers>=4.39            # HuggingFace base (required by sentence-transformers)
+torch>=2.2.0                  # CPU build; use torch+cu121 wheels for GPU
+
+# Vector DB
+faiss-cpu>=1.8                # swap to faiss-gpu for CUDA
+
+# ML
+scikit-learn>=1.4             # GBM meta-learner
+xgboost>=2.0                  # optional: faster GBM
+
+# Social ingestion
+asyncpraw>=7.7                # async Reddit API client
+
+# Validation & config
+pydantic>=2.6
+python-dotenv>=1.0
+
+# Utilities
+tqdm>=4.66

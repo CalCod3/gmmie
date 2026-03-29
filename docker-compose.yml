@@ -1,0 +1,47 @@
+version: "3.9"
+
+services:
+
+  app:
+    build: .
+    container_name: gmmie-app
+    ports:
+      - "8001:8001"
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      - REDIS_URL=redis://redis:6379
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: gmmie-redis
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 5
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: gmmie-postgres
+    environment:
+      POSTGRES_DB: gmmie
+      POSTGRES_USER: gmmie
+      POSTGRES_PASSWORD: gmmie_secret
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gmmie"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  redis-data:
+  postgres-data:
