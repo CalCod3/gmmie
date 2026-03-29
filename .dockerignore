@@ -1,0 +1,33 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+env/
+
+# Node / frontend (VERY IMPORTANT)
+node_modules/
+dist/
+build/
+
+# Logs / data
+*.log
+data/
+datasets/
+*.csv
+*.parquet
+
+# OS junk
+.DS_Store
+
+# Docker
+docker-compose.yml
+
+# Misc
+*.zip
+*.tar.gz
