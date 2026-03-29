@@ -11,7 +11,7 @@ services:
       redis:
         condition: service_healthy
     environment:
-      - REDIS_URL=redis://redis:6379
+      - REDIS_URL=${{REDIS_URL}}
     restart: unless-stopped
 
   redis:
