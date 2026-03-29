@@ -1,5 +1,5 @@
 # ---- Base Image ----
-FROM python:3.11-slim@sha256:latest
+FROM python:3.11-slim
 
 # ---- Environment ----
 ENV PYTHONDONTWRITEBYTECODE=1 \
