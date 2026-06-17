@@ -26,6 +26,36 @@ import aiohttp
 logger = logging.getLogger(__name__)
 
 
+# ── Bounded de-dup set ────────────────────────────────────────────────────────
+
+class _BoundedSeenSet:
+    """LRU-like bounded set for de-duplicating ingested URLs / IDs.
+
+    The original implementation used `set()` and grew without bound, leaking
+    memory across a multi-day run (NewsAPI alone produces ~50k urls/day).
+    """
+
+    __slots__ = ("_cap", "_set", "_order")
+
+    def __init__(self, capacity: int = 10_000):
+        from collections import deque
+        self._cap   = capacity
+        self._set:  set   = set()
+        self._order: deque = deque()
+
+    def __contains__(self, item) -> bool:
+        return item in self._set
+
+    def add(self, item) -> None:
+        if item in self._set:
+            return
+        if len(self._set) >= self._cap:
+            old = self._order.popleft()
+            self._set.discard(old)
+        self._set.add(item)
+        self._order.append(item)
+
+
 # ── Schema ────────────────────────────────────────────────────────────────────
 
 class EventType(str, Enum):
@@ -314,7 +344,7 @@ class NewsAPIIngester(BaseIngester):
         self._api_key = api_key
         self._query   = query or 'gold OR XAUUSD OR "Federal Reserve" OR CPI OR inflation'
         self._poll_s  = poll_interval
-        self._seen:   set = set()
+        self._seen   = _BoundedSeenSet(10_000)
 
     async def _stream(self) -> AsyncGenerator[RawEvent, None]:
         if not self._api_key:
@@ -381,7 +411,7 @@ class GDELTIngester(BaseIngester):
         super().__init__(queue, "gdelt")
         self._query  = query or "gold Federal Reserve inflation"
         self._poll_s = poll_interval
-        self._seen:  set = set()
+        self._seen   = _BoundedSeenSet(10_000)
 
     async def _stream(self) -> AsyncGenerator[RawEvent, None]:
         async with aiohttp.ClientSession() as session:
@@ -460,7 +490,7 @@ class RedditIngester(BaseIngester):
         self._user_agent    = user_agent
         self._subreddits    = subreddits or ["Gold", "Economics", "investing", "Forex"]
         self._poll_s        = poll_interval
-        self._seen:         set = set()
+        self._seen          = _BoundedSeenSet(20_000)
 
     async def _stream(self) -> AsyncGenerator[RawEvent, None]:
         if not self._client_id or not self._client_secret:

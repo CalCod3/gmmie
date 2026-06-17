@@ -126,22 +126,69 @@ _NORMALIZERS = {
 # ── Online z-scaler ───────────────────────────────────────────────────────────
 
 class RollingZScaler:
-    def __init__(self, window: int = 200):
+    """
+    Hybrid online scaler:
+      · O(1) per update using EWMA mean / variance (no full-buffer recompute)
+      · Tracks rolling MAD (median absolute deviation) on a bounded deque so
+        the scaler is robust to fat-tailed shocks (e.g. flash crashes,
+        FOMC prints) which would inflate a Welford σ and depress z-scores.
+
+    Returns the *robust* z-score by default: (x − median) / (1.4826·MAD).
+    Falls back to EWMA-σ when the MAD buffer is cold (< 30 samples).
+    """
+
+    _MAD_NORM = 1.4826    # MAD → Normal-consistent σ
+    _ROBUST_CLIP = 8.0    # clip extreme z (anti winner-takes-all)
+
+    def __init__(self, window: int = 200, ewma_alpha: float = 0.02):
+        from collections import deque
         self._window = window
-        self._buf: List[float] = []
+        self._buf:    deque = deque(maxlen=window)
+        self._alpha  = ewma_alpha
+        self._mu_ewma: float = 0.0
+        self._var_ewma: float = 1.0
+        self._n: int = 0
 
     def transform(self, value: float) -> float:
-        self._buf.append(value)
-        if len(self._buf) > self._window:
-            self._buf.pop(0)
-        arr    = np.array(self._buf, dtype=np.float32)
-        mu, sd = arr.mean(), arr.std()
-        return float((value - mu) / (sd + 1e-8))
+        x = float(value)
+
+        # EWMA mean / variance (O(1))
+        if self._n == 0:
+            self._mu_ewma = x
+            self._var_ewma = 1.0
+        else:
+            d = x - self._mu_ewma
+            self._mu_ewma  = self._mu_ewma + self._alpha * d
+            self._var_ewma = (1 - self._alpha) * (self._var_ewma + self._alpha * d * d)
+        self._n += 1
+        self._buf.append(x)
+
+        # Robust scaling once we have enough samples
+        if len(self._buf) >= 30:
+            arr = np.fromiter(self._buf, dtype=np.float64, count=len(self._buf))
+            med = float(np.median(arr))
+            mad = float(np.median(np.abs(arr - med)))
+            sigma = self._MAD_NORM * mad if mad > 1e-12 else np.sqrt(self._var_ewma)
+            z = (x - med) / (sigma + 1e-12)
+        else:
+            z = (x - self._mu_ewma) / (np.sqrt(self._var_ewma) + 1e-12)
+
+        return float(np.clip(z, -self._ROBUST_CLIP, self._ROBUST_CLIP))
 
     @property
-    def mean(self) -> float: return float(np.mean(self._buf)) if self._buf else 0.0
+    def mean(self) -> float:
+        if not self._buf:
+            return 0.0
+        return float(np.median(np.fromiter(self._buf, dtype=np.float64, count=len(self._buf))))
+
     @property
-    def std(self)  -> float: return float(np.std(self._buf))  if self._buf else 1.0
+    def std(self) -> float:
+        if len(self._buf) < 2:
+            return 1.0
+        arr = np.fromiter(self._buf, dtype=np.float64, count=len(self._buf))
+        med = float(np.median(arr))
+        mad = float(np.median(np.abs(arr - med)))
+        return float(self._MAD_NORM * mad) if mad > 1e-12 else float(np.sqrt(self._var_ewma))
 
 
 # ── Pipeline ──────────────────────────────────────────────────────────────────

@@ -264,54 +264,74 @@ class NSSMWorldStateModel:
     """
     Neural State Space Model — core of GMMIE.
 
-    z_{t+1} = f(z_t, x_t)   (transition with gating)
-    y_t      = g(z_t)         (emission)
+    z_{t+1|t} = f(z_t, x_t)                 (nonlinear transition with gating)
+    z_{t+1|t+1} = z_{t+1|t} + K · (m_t - H z_{t+1|t})    (Kalman correction)
+    y_t       = g(z_t)                      (observation / emission)
 
-    Improvements:
-      · Xavier initialisation (replaces small-normal causing vanishing gradients)
-      · Per-factor EMA smoothing (different timescales per factor)
-      · Diagonal uncertainty covariance P (Kalman-like variance tracking)
-      · Factor interaction matrix M: z' ← tanh(Az + Bx + Mz⊗z) captures
-        nonlinear factor interactions (e.g. momentum × sentiment → regime)
+    v3 improvements:
+      · Explicit Kalman update step: the measurement m_t is a low-dim summary
+        of x_t produced by H (here a Linear), and K = P H^T (H P H^T + R)^-1
+        on the diagonal approximation. This replaces the bare EMA blend with
+        an uncertainty-weighted correction, so high-confidence inputs move
+        z faster than noisy ones.
+      · Per-factor process noise Q is calibrated to factor timescale.
+      · Process noise injection keeps P from collapsing to zero (a problem in
+        the v2 EMA-only update — uncertainty would monotonically shrink).
     """
 
     def __init__(self, input_dim: int = 128, latent_dim: int = 16,
                  hidden_dim: int = 128):
         self.latent_dim = latent_dim
         self._z = np.zeros(latent_dim, dtype=np.float32)
-        self._P = np.ones(latent_dim, dtype=np.float32) * 0.1   # uncertainty
+        self._P = np.ones(latent_dim, dtype=np.float32) * 0.5   # uncertainty
 
-        # Transition network: [z; x] → hidden → z'
+        # Transition network: [z; x] → hidden → Δz
         self._trans_fc1 = Linear(latent_dim + input_dim, hidden_dim, seed=40)
         self._trans_fc2 = Linear(hidden_dim, latent_dim, seed=41)
 
         # Gating: [z; x] → gate ∈ [0,1] per latent dim
         self._gate_fc   = Linear(latent_dim + input_dim, latent_dim, seed=43)
 
+        # Measurement projection H: x → measurement of dim latent_dim
+        self._H_proj    = Linear(input_dim, latent_dim, seed=44)
+
         # Emission: z → observable
         self._emit_fc   = Linear(latent_dim, latent_dim, seed=42)
 
-        # Per-factor EMA alphas
+        # Per-factor EMA alphas (used now as Kalman gain prior)
         self._ema_alphas = np.array([
             _FACTOR_ALPHA.get(FACTOR_NAMES[i], 0.15)
             for i in range(latent_dim)
         ], dtype=np.float32)
 
+        # Process noise Q ∝ α  (fast factors → noisier dynamics)
+        self._Q = (self._ema_alphas * 0.05).astype(np.float32)
+        # Observation noise R per factor — slow factors have noisier measurements
+        self._R = (0.5 - 0.3 * self._ema_alphas).astype(np.float32)
+
     def update(self, fused_embedding: np.ndarray) -> np.ndarray:
         inp = np.concatenate([self._z, fused_embedding]).astype(np.float32)
 
-        h     = _relu(self._trans_fc1(inp))
-        z_new = _tanh(self._trans_fc2(h))
+        # ---- Prediction step ----------------------------------------------
+        h      = _relu(self._trans_fc1(inp))
+        z_pred = self._z + _tanh(self._trans_fc2(h)) * self._ema_alphas
+        # Predicted covariance: P_pred = P + Q
+        P_pred = self._P + self._Q
 
-        # Gated update: gate controls how much new info blends in per factor
-        gate  = _sigmoid(self._gate_fc(inp))
+        # ---- Measurement & Kalman correction ------------------------------
+        m       = _tanh(self._H_proj(fused_embedding.astype(np.float32)))
+        # Diagonal Kalman gain
+        K       = P_pred / (P_pred + self._R + 1e-8)
+        # Gate scales how strongly the measurement is trusted at all
+        gate    = _sigmoid(self._gate_fc(inp))
+        K_eff   = K * gate
 
-        # Per-factor EMA with gate modulation
-        eff_alpha = self._ema_alphas * gate
-        self._z   = eff_alpha * z_new + (1 - eff_alpha) * self._z
+        innovation = m - z_pred
+        self._z    = z_pred + K_eff * innovation
+        self._P    = (1.0 - K_eff) * P_pred
 
-        # Update uncertainty: high gate → more uncertainty reduction
-        self._P = (1 - eff_alpha) * self._P + eff_alpha ** 2 * 0.01
+        # Bound uncertainty
+        self._P = np.clip(self._P, 1e-4, 2.0)
 
         return self._z.copy()
 

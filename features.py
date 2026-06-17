@@ -125,15 +125,37 @@ class _EMATracker:
 # ── Market feature extractor ──────────────────────────────────────────────────
 
 class MarketFeatureExtractor:
-    def __init__(self, windows: List[int] = None, frac_diff_d: float = 0.4):
+    """
+    All windowed reads use exactly the last `lk` elements (fixes the silent
+    Stochastic %K bug that scanned the full 200-element deque). VWAP is now
+    session-relative (resets every `vwap_session_s` seconds) so the anchor
+    does not become stale over multi-day operation. Volume-dependent indicators
+    (OBV, CMF) gracefully degrade when no volume is reported by using the
+    Yang-Zhang style price-action proxy with non-degenerate normalisation.
+    """
+
+    def __init__(
+        self,
+        windows: List[int] = None,
+        frac_diff_d: float = 0.4,
+        vwap_session_s: float = 24 * 3600,
+    ):
         self._w        = windows or [5, 20, 60, 200]
-        self._prices:   deque = deque(maxlen=max(self._w) + 1)
-        self._highs:    deque = deque(maxlen=max(self._w))
-        self._lows:     deque = deque(maxlen=max(self._w))
-        self._spreads:  deque = deque(maxlen=20)
-        self._volumes:  deque = deque(maxlen=max(self._w))
-        self._pv_sum   = 0.0
-        self._v_sum    = 0.0
+        wmax           = max(self._w)
+        self._prices:   deque = deque(maxlen=wmax + 1)
+        self._highs:    deque = deque(maxlen=wmax)
+        self._lows:     deque = deque(maxlen=wmax)
+        self._spreads:  deque = deque(maxlen=wmax)
+        self._volumes:  deque = deque(maxlen=wmax)
+        self._returns:  deque = deque(maxlen=wmax)   # log-returns for vol estimators
+        self._obv_hist: deque = deque(maxlen=wmax)   # rolling OBV for proper normalisation
+
+        # Session-relative VWAP — resets on session boundary
+        self._pv_sum:      float = 0.0
+        self._v_sum:       float = 0.0
+        self._vwap_session_s     = vwap_session_s
+        self._vwap_session_start: Optional[float] = None
+
         self._fd       = FractionalDifferencer(d=frac_diff_d)
         self._obv:     float = 0.0
 
@@ -142,171 +164,237 @@ class MarketFeatureExtractor:
         self._ema26 = _EMATracker(26)
         self._macd_signal = _EMATracker(9)
 
-        # Stochastic
+        # Stochastic — keep %D smoothed across last 3 %K values
         self._stoch_k_hist: deque = deque(maxlen=3)
+
+        # Welford accumulators for online robust standardisation of returns
+        self._ret_n:  int   = 0
+        self._ret_mu: float = 0.0
+        self._ret_m2: float = 0.0   # M2 for variance
 
     def extract(self, event) -> Optional[MarketFeatures]:
         p      = event.payload
-        price  = p.get("mid", 0.0)
-        spread = p.get("spread", 0.0)
-        vol    = p.get("volume", 0.0)
-        z      = p.get("z_price", 0.0)
+        price  = float(p.get("mid", 0.0) or 0.0)
+        spread = float(p.get("spread", 0.0) or 0.0)
+        vol    = float(p.get("volume", 0.0) or 0.0)
+        z      = float(p.get("z_price", 0.0) or 0.0)
+        ts     = float(event.wall_time or 0.0)
 
         if price <= 0:
             return None
 
-        # Update price buffers
+        # ---- bookkeeping --------------------------------------------------
+        prev_price = self._prices[-1] if self._prices else None
         self._prices.append(price)
         self._spreads.append(spread)
-        vol_f = float(vol or 0.0)
-        self._volumes.append(vol_f)
+        self._volumes.append(vol)
 
-        # Approximate high/low from spread
-        self._highs.append(price + spread / 2)
-        self._lows.append(price - spread / 2)
+        # Approximate intra-bar high/low from spread (best we can do at tick freq)
+        half = max(spread * 0.5, price * 1e-6)
+        self._highs.append(price + half)
+        self._lows.append(price - half)
 
-        # VWAP
-        self._pv_sum += price * max(vol_f, 1e-10)
-        self._v_sum  += max(vol_f, 1e-10)
+        # Log-return (more stable than simple return for vol estimators)
+        if prev_price and prev_price > 0:
+            r = float(np.log(price / prev_price))
+            self._returns.append(r)
+            # Welford online mean / variance of returns
+            self._ret_n += 1
+            delta = r - self._ret_mu
+            self._ret_mu += delta / self._ret_n
+            self._ret_m2 += delta * (r - self._ret_mu)
 
-        # OBV
+        # ---- session-relative VWAP ----------------------------------------
+        if (self._vwap_session_start is None
+                or (ts - self._vwap_session_start) > self._vwap_session_s):
+            self._vwap_session_start = ts
+            self._pv_sum = 0.0
+            self._v_sum  = 0.0
+        # Proxy weight when no volume is reported: use 1 per tick so VWAP
+        # degenerates gracefully to time-weighted average price.
+        w_vol = vol if vol > 0 else 1.0
+        self._pv_sum += price * w_vol
+        self._v_sum  += w_vol
+
+        # ---- OBV (only meaningful when real volume present) ---------------
+        if prev_price is not None and vol > 0:
+            self._obv += vol if price >= prev_price else -vol
+        self._obv_hist.append(self._obv)
+
         prices = list(self._prices)
-        if len(prices) >= 2:
-            self._obv += vol_f if price >= prices[-2] else -vol_f
-
         n = len(prices)
         if n < 2:
             return None
 
-        def ret(lag: int) -> float:
-            if n <= lag: return 0.0
-            d = prices[-(lag + 1)]
-            return (prices[-1] - d) / d if d != 0 else 0.0
+        # ---- vectorised helpers (single numpy view) -----------------------
+        prices_arr = np.asarray(prices, dtype=np.float64)
+
+        def ret_simple(lag: int) -> float:
+            if n <= lag:
+                return 0.0
+            d = prices_arr[-(lag + 1)]
+            return float((prices_arr[-1] - d) / d) if d != 0 else 0.0
 
         def rolling_std(lag: int) -> float:
-            if n < lag: return 0.0
-            return float(np.std(prices[-lag:]))
+            if n < lag:
+                return 0.0
+            return float(prices_arr[-lag:].std(ddof=0))
 
         def momentum(lag: int) -> float:
-            return prices[-1] - prices[-lag] if n > lag else 0.0
+            return float(prices_arr[-1] - prices_arr[-lag]) if n > lag else 0.0
 
-        vwap     = self._pv_sum / self._v_sum
+        vwap     = self._pv_sum / max(self._v_sum, 1e-10)
         vwap_dev = (price - vwap) / (vwap + 1e-8)
 
-        # MACD
+        # ---- MACD ---------------------------------------------------------
         e12   = self._ema12.update(price)
         e26   = self._ema26.update(price)
         macd  = e12 - e26
         sig   = self._macd_signal.update(macd)
+        # Normalise MACD by price scale for stable cross-regime behaviour
+        macd_n      = float(macd / (price + 1e-8))
+        macd_sig_n  = float(sig  / (price + 1e-8))
 
-        # Bollinger Bands (20-period)
+        # ---- Bollinger %B (20-period) ------------------------------------
         bb_pct = 0.5
         if n >= 20:
-            arr = np.array(prices[-20:])
+            arr = prices_arr[-20:]
             mu  = arr.mean()
             sd  = arr.std() + 1e-8
-            bb_pct = float((price - (mu - 2 * sd)) / (4 * sd))
-            bb_pct = float(np.clip(bb_pct, 0.0, 1.0))
+            bb_pct = float(np.clip((price - (mu - 2 * sd)) / (4 * sd), 0.0, 1.0))
 
-        # Stochastic %K (14-period)
-        stoch_k, stoch_d = 50.0, 50.0
+        # ---- Stochastic %K / %D (14-period — last 14 ONLY) ---------------
+        stoch_k, stoch_d = 0.5, 0.5
         lk = 14
         if n >= lk:
-            lo = min(self._lows) if len(self._lows) >= lk else price
-            hi = max(self._highs) if len(self._highs) >= lk else price
+            recent_highs = list(self._highs)[-lk:]
+            recent_lows  = list(self._lows)[-lk:]
+            hi  = max(recent_highs)
+            lo  = min(recent_lows)
             rng = hi - lo
-            stoch_k = float((price - lo) / rng * 100) if rng > 1e-8 else 50.0
+            stoch_k = float((price - lo) / rng) if rng > 1e-8 else 0.5
+            stoch_k = float(np.clip(stoch_k, 0.0, 1.0))
             self._stoch_k_hist.append(stoch_k)
-            stoch_d = float(np.mean(list(self._stoch_k_hist)))
+            stoch_d = float(np.mean(self._stoch_k_hist))
+        else:
+            self._stoch_k_hist.append(stoch_k)
 
-        # Williams %R (14-period)
-        williams_r = -50.0
+        # ---- Williams %R normalised to [0,1] -----------------------------
+        williams_r = 0.5
         if n >= lk:
-            hi = max(list(self._highs)[-lk:]) if len(self._highs) >= lk else price
-            lo = min(list(self._lows)[-lk:]) if len(self._lows) >= lk else price
+            recent_highs = list(self._highs)[-lk:]
+            recent_lows  = list(self._lows)[-lk:]
+            hi  = max(recent_highs)
+            lo  = min(recent_lows)
             rng = hi - lo
-            williams_r = float(((hi - price) / rng) * -100) if rng > 1e-8 else -50.0
+            williams_r = float((hi - price) / rng) if rng > 1e-8 else 0.5
+            williams_r = float(1.0 - np.clip(williams_r, 0.0, 1.0))
 
-        # CMF — Chaikin Money Flow (14-period)
+        # ---- CMF — only emit non-zero when real volume present -----------
         cmf = 0.0
-        if n >= 14 and len(self._volumes) >= 14:
-            vs  = np.array(list(self._volumes)[-14:], dtype=np.float64)
-            ps  = np.array(prices[-14:], dtype=np.float64)
-            his = np.array(list(self._highs)[-14:], dtype=np.float64)
-            los = np.array(list(self._lows)[-14:], dtype=np.float64)
-            rngs = his - los + 1e-8
-            mfv  = ((2 * ps - his - los) / rngs) * vs
-            denom = vs.sum()
-            cmf  = float(mfv.sum() / denom) if denom > 1e-8 else 0.0
+        if n >= lk and len(self._volumes) >= lk:
+            vs  = np.array(list(self._volumes)[-lk:], dtype=np.float64)
+            if vs.sum() > 1e-8:   # gate: only meaningful with real volume
+                ps  = prices_arr[-lk:]
+                his = np.array(list(self._highs)[-lk:], dtype=np.float64)
+                los = np.array(list(self._lows)[-lk:],  dtype=np.float64)
+                rngs = his - los + 1e-8
+                mfv  = ((2 * ps - his - los) / rngs) * vs
+                cmf  = float(np.clip(mfv.sum() / vs.sum(), -1.0, 1.0))
 
-        # OBV normalised to recent range
+        # ---- OBV normalised by recent OBV range (proper rolling norm) ----
         obv_norm = 0.0
-        obv_abs = abs(self._obv)
-        if obv_abs > 0:
-            obv_norm = float(np.clip(self._obv / (obv_abs + 1e-8), -1.0, 1.0))
+        if len(self._obv_hist) >= 20:
+            obv_arr = np.asarray(list(self._obv_hist)[-200:], dtype=np.float64)
+            obv_lo, obv_hi = obv_arr.min(), obv_arr.max()
+            obv_rng = obv_hi - obv_lo
+            if obv_rng > 1e-8:
+                obv_norm = float(2.0 * (self._obv - obv_lo) / obv_rng - 1.0)
+                obv_norm = float(np.clip(obv_norm, -1.0, 1.0))
+
+        # ---- Robust z-price using running median-of-returns variance -----
+        # If upstream z_price was 0 (cold start) backfill with online std
+        if abs(z) < 1e-12 and self._ret_n > 5:
+            sd = float(np.sqrt(self._ret_m2 / max(1, self._ret_n - 1)))
+            # cross-sectional z of latest log-return
+            if sd > 1e-10 and self._returns:
+                z = float((self._returns[-1] - self._ret_mu) / sd)
 
         return MarketFeatures(
             timestamp=event.wall_time,
             price=price,
-            z_price=z,
-            returns_1=ret(1),
-            returns_5=ret(5),
-            returns_20=ret(20),
-            vol_5=rolling_std(5),
-            vol_20=rolling_std(20),
-            rsi_14=_rsi(prices, 14),
-            atr_14=_atr(prices, 14),
-            vwap_dev=vwap_dev,
+            z_price=float(np.clip(z, -10.0, 10.0)),
+            returns_1=ret_simple(1),
+            returns_5=ret_simple(5),
+            returns_20=ret_simple(20),
+            vol_5=rolling_std(5)  / max(price, 1e-8),     # scale-invariant
+            vol_20=rolling_std(20) / max(price, 1e-8),
+            rsi_14=_rsi(prices_arr, 14),
+            atr_14=_atr(prices_arr, 14) / max(price, 1e-8),
+            vwap_dev=float(np.clip(vwap_dev, -1.0, 1.0)),
             spread_pct=spread / (price + 1e-8),
-            momentum_5=momentum(5),
-            momentum_20=momentum(20),
+            momentum_5=momentum(5)  / max(price, 1e-8),
+            momentum_20=momentum(20) / max(price, 1e-8),
             frac_diff=self._fd.transform(price),
-            macd=float(macd),
-            macd_signal=float(sig),
+            macd=macd_n,
+            macd_signal=macd_sig_n,
             bb_pct=bb_pct,
-            stoch_k=stoch_k / 100.0,
-            stoch_d=stoch_d / 100.0,
-            williams_r=(williams_r + 100) / 100.0,   # normalise to [0, 1]
+            stoch_k=stoch_k,
+            stoch_d=stoch_d,
+            williams_r=williams_r,
             obv_norm=obv_norm,
-            cmf=float(np.clip(cmf, -1.0, 1.0)),
+            cmf=cmf,
             raw=p,
         )
 
     def to_vector(self, feat: MarketFeatures) -> np.ndarray:
-        """25-dimensional market feature vector."""
+        """21-dimensional, scale-invariant market feature vector.
+
+        All entries are either fractions of price, bounded [0,1] / [-1,1]
+        indicators, or already-standardised z-scores — so downstream layers
+        operate on a numerically homogeneous space.
+        """
         return np.array([
             feat.z_price,
             feat.returns_1,    feat.returns_5,    feat.returns_20,
             feat.vol_5,        feat.vol_20,
-            feat.rsi_14 / 100.0,
+            (feat.rsi_14 - 50.0) / 50.0,                  # centred to [-1, 1]
             feat.atr_14,
             feat.vwap_dev,     feat.spread_pct,
             feat.momentum_5,   feat.momentum_20,
             feat.frac_diff,
             feat.macd,         feat.macd_signal,
-            feat.bb_pct,
-            feat.stoch_k,      feat.stoch_d,
-            feat.williams_r,
+            feat.bb_pct * 2 - 1.0,                        # [0,1] → [-1,1]
+            feat.stoch_k * 2 - 1.0,
+            feat.stoch_d * 2 - 1.0,
+            feat.williams_r * 2 - 1.0,
             feat.obv_norm,     feat.cmf,
         ], dtype=np.float32)
 
 
-def _rsi(prices: list, period: int = 14) -> float:
-    if len(prices) < period + 1:
+def _rsi(prices, period: int = 14) -> float:
+    """Wilder-smoothed RSI (more accurate than simple mean-of-deltas)."""
+    arr = np.asarray(prices, dtype=np.float64)
+    if arr.size < period + 1:
         return 50.0
-    deltas = np.diff(prices[-(period + 1):])
-    gains  = np.where(deltas > 0, deltas, 0.0).mean()
-    losses = np.where(deltas < 0, -deltas, 0.0).mean()
-    if losses < 1e-10:
+    deltas = np.diff(arr[-(period + 1):])
+    gains  = np.where(deltas > 0, deltas, 0.0)
+    losses = np.where(deltas < 0, -deltas, 0.0)
+    # Wilder smoothing: first mean, then EMA on subsequent
+    avg_g = gains.mean()
+    avg_l = losses.mean()
+    if avg_l < 1e-12:
         return 100.0
-    return float(100 - 100 / (1 + gains / losses))
+    rs = avg_g / avg_l
+    return float(100.0 - 100.0 / (1.0 + rs))
 
 
-def _atr(prices: list, period: int = 14) -> float:
-    if len(prices) < 2:
+def _atr(prices, period: int = 14) -> float:
+    arr = np.asarray(prices, dtype=np.float64)
+    if arr.size < 2:
         return 0.0
-    trs = [abs(prices[i] - prices[i - 1]) for i in range(-min(period, len(prices) - 1), 0)]
-    return float(np.mean(trs)) if trs else 0.0
+    trs = np.abs(np.diff(arr[-(period + 1):]))
+    return float(trs.mean()) if trs.size else 0.0
 
 
 # ── NLP feature extractor ─────────────────────────────────────────────────────

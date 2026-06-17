@@ -183,6 +183,31 @@ class DeliveryConfig:
 
 
 @dataclass
+class LakeConfig:
+    """Offline data lake + research pipeline."""
+    lake_path:           str = field(default_factory=lambda: _env(
+        "GMMIE_LAKE_PATH", "data/lake/gmmie.duckdb"))
+    cache_dir:           str = field(default_factory=lambda: _env(
+        "GMMIE_CACHE_DIR", "data/cache"))
+    backtest_train_days: int = 252 * 8
+    backtest_test_days:  int = 63
+    embargo_days:        int = 5
+
+
+@dataclass
+class LLMConfig:
+    """Strategist + extractor."""
+    backend:        str = field(default_factory=lambda: _env("LLM_BACKEND", "ollama"))
+    claude_model:   str = field(default_factory=lambda: _env(
+        "CLAUDE_MODEL", "claude-haiku-4-5-20251001"))
+    ollama_model:   str = field(default_factory=lambda: _env(
+        "OLLAMA_MODEL", "llama3.1:8b-instruct-q4_K_M"))
+    ollama_url:     str = field(default_factory=lambda: _env(
+        "OLLAMA_URL", "http://localhost:11434"))
+    anthropic_key:  str = field(default_factory=lambda: _env("ANTHROPIC_API_KEY"))
+
+
+@dataclass
 class GMMIEConfig:
     market_data: MarketDataConfig   = field(default_factory=MarketDataConfig)
     news:        NewsConfig         = field(default_factory=NewsConfig)
@@ -195,6 +220,8 @@ class GMMIEConfig:
     meta:        MetaLearningConfig = field(default_factory=MetaLearningConfig)
     memory:      MemoryConfig       = field(default_factory=MemoryConfig)
     delivery:    DeliveryConfig     = field(default_factory=DeliveryConfig)
+    lake:        LakeConfig         = field(default_factory=LakeConfig)
+    llm:         LLMConfig          = field(default_factory=LLMConfig)
 
     device:           str  = field(default_factory=lambda: _env("DEVICE", "cpu"))
     log_level:        str  = field(default_factory=lambda: _env("LOG_LEVEL", "INFO"))

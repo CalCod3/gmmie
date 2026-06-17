@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections import deque
 from typing import Optional
 
 import numpy as np
@@ -49,41 +50,217 @@ _DEBUG_INTERVAL_S = 300   # 5 minutes
 # ── Attention allocation ──────────────────────────────────────────────────────
 
 class AttentionAllocationEngine:
+    """
+    Softmax-tempered inverse-error attention allocator.
+
+    The temperature τ controls how peaked the allocation becomes — at τ→∞
+    weights converge to uniform; at τ→0 the lowest-error modality dominates.
+    Default τ=2 trades off responsiveness vs stability.
+    """
+
     MODALITIES = ["market", "macro", "sentiment", "events"]
 
-    def __init__(self):
+    def __init__(self, temperature: float = 2.0):
+        self._tau     = temperature
         self._errors  = {m: 0.1 for m in self.MODALITIES}
         self._weights = {m: 1.0 / len(self.MODALITIES) for m in self.MODALITIES}
 
     def update(self, modality: str, error: float) -> None:
         if modality in self._errors:
-            self._errors[modality] = 0.9 * self._errors[modality] + 0.1 * abs(error)
+            # EMA on absolute error (bounded to [0, 5])
+            e = float(min(5.0, abs(error)))
+            self._errors[modality] = 0.92 * self._errors[modality] + 0.08 * e
 
     def get_weights(self) -> dict:
-        inv = np.array(
-            [1.0 / (self._errors[m] + 1e-6) for m in self.MODALITIES], dtype=np.float32
-        )
-        exp = np.exp(inv - inv.max())
+        # Negative log error as logit (lower error → higher weight)
+        logits = -np.array(
+            [np.log(self._errors[m] + 1e-3) for m in self.MODALITIES],
+            dtype=np.float32,
+        ) / max(self._tau, 1e-3)
+        exp = np.exp(logits - logits.max())
         w   = exp / exp.sum()
         self._weights = {m: float(v) for m, v in zip(self.MODALITIES, w)}
         return self._weights
 
 
-# ── Regime classifier ─────────────────────────────────────────────────────────
+# ── Adaptive regime classifier ────────────────────────────────────────────────
 
+class AdaptiveRegimeClassifier:
+    """
+    Sticky regime classifier with rolling-quantile thresholds.
+
+    Why this is better than the hard-coded thresholds:
+      · Hard thresholds (risk > 0.65 etc.) assume the NSSM emit() outputs are
+        well-calibrated to a fixed scale. They aren't — the sigmoid-projected
+        latents drift slowly as the model accumulates state.
+      · Rolling-quantile thresholds adapt to whatever distribution the model
+        actually produces, so the classifier remains meaningful across the
+        full operating range.
+      · Stickiness (self-transition bias) suppresses spurious flicker between
+        regimes when factors hover near a threshold — equivalent to an HMM
+        with high self-transition prior.
+    """
+
+    REGIMES = ["RISK-ON", "RISK-OFF", "TRENDING", "RANGING"]
+
+    def __init__(self, history: int = 500, stickiness: float = 0.6):
+        self._hist:    dict = {k: deque(maxlen=history) for k in
+                                ("risk_regime", "volatility_state",
+                                 "momentum_short", "momentum_long",
+                                 "liquidity", "mean_reversion")}
+        self._sticky      = float(stickiness)
+        self._cur_regime  = "RANGING"
+        # Per-regime confidence (softmax-blended)
+        self._reg_score   = {r: 0.25 for r in self.REGIMES}
+
+    def _q(self, key: str, p: float, default: float = 0.5) -> float:
+        h = self._hist[key]
+        if len(h) < 30:
+            return default
+        return float(np.quantile(np.fromiter(h, dtype=np.float64, count=len(h)), p))
+
+    def classify(self, ws: dict) -> str:
+        # Update rolling history
+        for k in self._hist:
+            v = ws.get(k)
+            if v is not None:
+                self._hist[k].append(float(v))
+
+        risk     = ws.get("risk_regime",      0.5)
+        vol      = ws.get("volatility_state", 0.5)
+        mom      = ws.get("momentum_short",   0.5)
+        mom_l    = ws.get("momentum_long",    0.5)
+        liq      = ws.get("liquidity",        0.5)
+        mr       = ws.get("mean_reversion",   0.5)
+
+        # Quantile-derived thresholds (adaptive)
+        risk_hi   = self._q("risk_regime",     0.65, 0.65)
+        risk_lo   = self._q("risk_regime",     0.35, 0.35)
+        vol_hi    = self._q("volatility_state", 0.70, 0.70)
+        vol_lo    = self._q("volatility_state", 0.40, 0.40)
+        mom_hi    = self._q("momentum_short",   0.65, 0.60)
+        mom_l_hi  = self._q("momentum_long",    0.55, 0.55)
+        liq_hi    = self._q("liquidity",        0.50, 0.50)
+        mr_hi     = self._q("mean_reversion",   0.60, 0.60)
+
+        # Soft scores per regime
+        scores = {
+            "RISK-ON":  max(0.0, (risk - risk_hi) + (vol_lo - vol) + (liq - liq_hi)),
+            "RISK-OFF": max(0.0, (risk_lo - risk) + (vol - vol_hi)),
+            "TRENDING": max(0.0, (mom - mom_hi) + (mom_l - mom_l_hi)),
+            "RANGING":  max(0.0, (mr - mr_hi) + 0.1),   # default fallback
+        }
+
+        # Sticky update: bias toward previous regime
+        for r in self.REGIMES:
+            self._reg_score[r] = ((1 - self._sticky) * scores[r]
+                                  + self._sticky * self._reg_score[r])
+            if r == self._cur_regime:
+                self._reg_score[r] += 0.05      # tiny self-transition bonus
+
+        self._cur_regime = max(self._reg_score, key=self._reg_score.get)
+        return self._cur_regime
+
+    def confidence(self) -> float:
+        vals = np.array(list(self._reg_score.values()), dtype=np.float64)
+        e = np.exp(vals - vals.max())
+        p = e / e.sum()
+        return float(p.max())
+
+
+# Kept for backward compatibility with any external callers
 def classify_regime(ws: dict) -> str:
+    """Deprecated: use AdaptiveRegimeClassifier. Provided as a stateless shim."""
     risk     = ws.get("risk_regime",      0.5)
     vol      = ws.get("volatility_state", 0.5)
     mom      = ws.get("momentum_short",   0.5)
     mom_long = ws.get("momentum_long",    0.5)
     liq      = ws.get("liquidity",        0.5)
     mr       = ws.get("mean_reversion",   0.5)
-
     if risk > 0.65 and vol < 0.4 and liq > 0.5: return "RISK-ON"
     if risk < 0.35 or vol > 0.7:                 return "RISK-OFF"
     if mom > 0.6 and mom_long > 0.55:            return "TRENDING"
     if mr > 0.6:                                  return "RANGING"
     return "RANGING"
+
+
+# ── Outcome tracker (closes the prediction → ground-truth loop) ───────────────
+
+class OutcomeTracker:
+    """
+    Stores `(prediction, context, regime, ref_price)` at each tick. When the
+    realised price after `horizon` ticks arrives, computes the realised
+    log-return and dispatches it to:
+      · MetaLearningEngine.record  — trains the GBM error model
+      · PatternMemory.store        — replaces placeholder outcome=0.0 with
+                                     real signed log-return
+      · AttentionAllocationEngine  — feeds per-modality residuals so weights
+                                     reflect actual modality utility
+
+    Without this, the v2 codepath stored placeholder outcomes and never
+    closed the learning loop.
+    """
+
+    def __init__(self, horizon_ticks: int = 5, memory_horizon_ticks: int = 30):
+        self._fast_h  = horizon_ticks
+        self._mem_h   = memory_horizon_ticks
+        self._pending: deque = deque(maxlen=4 * max(horizon_ticks, memory_horizon_ticks) + 64)
+        self._tick_count: int = 0
+
+    def push(self, *, ref_price: float, predicted_logret: float,
+             fused_context: np.ndarray, regime: str,
+             modality_signals: dict, timestamp: float) -> None:
+        self._tick_count += 1
+        self._pending.append({
+            "settle_fast": self._tick_count + self._fast_h,
+            "settle_mem":  self._tick_count + self._mem_h,
+            "ref_price":   float(ref_price),
+            "pred_logret": float(predicted_logret),
+            "fused":       fused_context.copy(),
+            "regime":      regime,
+            "modalities":  dict(modality_signals),
+            "ts":          float(timestamp),
+        })
+
+    def settle(self, *, current_price: float, current_tick: int,
+               meta: "MetaLearningEngine",
+               memory: "PatternMemory",
+               attention: "AttentionAllocationEngine") -> int:
+        """Return number of outcomes settled this tick."""
+        settled = 0
+        # Process from oldest; we don't pop in the middle so re-build by filter
+        keep: list = []
+        for item in self._pending:
+            if current_tick >= item["settle_fast"] and "_fast_done" not in item:
+                if item["ref_price"] > 0 and current_price > 0:
+                    realised = float(np.log(current_price / item["ref_price"]))
+                    err = realised - item["pred_logret"]
+                    meta.record(item["fused"], abs(err), item["regime"])
+                    # Modality error attribution: assign the same residual to
+                    # whichever modality was most active for this tick.
+                    for mod, sig in item["modalities"].items():
+                        attention.update(mod, abs(err) * float(sig))
+                    settled += 1
+                item["_fast_done"] = True
+
+            if current_tick >= item["settle_mem"]:
+                if item["ref_price"] > 0 and current_price > 0:
+                    realised = float(np.log(current_price / item["ref_price"]))
+                    memory.store(
+                        item["fused"],
+                        label=f"t={item['ts']:.0f}",
+                        outcome=realised,           # ← REAL outcome (was 0.0)
+                        regime=item["regime"],
+                        timestamp=item["ts"],
+                    )
+                    settled += 1
+                continue   # drop after memory horizon
+
+            keep.append(item)
+
+        self._pending.clear()
+        self._pending.extend(keep)
+        return settled
 
 
 # ── Main engine ───────────────────────────────────────────────────────────────
@@ -113,6 +290,14 @@ class GMMIEEngine:
         self.meta       = MetaLearningEngine(self.cfg)
         self.memory     = PatternMemory(self.cfg)
         self.attention  = AttentionAllocationEngine()
+        self.regime_clf = AdaptiveRegimeClassifier()
+
+        # Outcome feedback: settle horizons of (5 ticks) for meta, (30) for memory
+        fast_h = min(self.cfg.forecast.horizons) if self.cfg.forecast.horizons else 5
+        self.outcomes  = OutcomeTracker(
+            horizon_ticks=int(fast_h),
+            memory_horizon_ticks=int(max(30, fast_h * 6)),
+        )
 
         self._last_price:    float = 0.0
         self._last_ws:       dict  = {}
@@ -224,6 +409,9 @@ class GMMIEEngine:
         if feat_type == "event":
             feat_type = "macro"
 
+        # Track per-event modality activations for attention attribution
+        active_modalities = {m: 0.0 for m in self.attention.MODALITIES}
+
         if feat_type == "market":
             self._ev_counts["market"] += 1
             self.embeddings.update_market(feat_vec)
@@ -231,15 +419,25 @@ class GMMIEEngine:
             if price > 0:
                 self._last_price = price
                 self.causal.push("GOLD", price)
+            active_modalities["market"] = 1.0
         elif feat_type == "text":
             self._ev_counts["text"] += 1
             self.embeddings.update_text(feat_vec)
             self.causal.push("SENTIMENT", feat_obj.sentiment_score)
+            # Higher confidence sentiment readings → more attention; baseline
+            # error = |1 - |sentiment||  so neutral text counts as "uncertain".
             self.attention.update("sentiment", 1 - abs(feat_obj.sentiment_score))
+            active_modalities["sentiment"] = abs(feat_obj.sentiment_score)
         elif feat_type == "macro":
             self._ev_counts["macro"] += 1
             self.embeddings.update_macro(feat_vec)
             self.attention.update("macro", 1 - feat_obj.impact_score)
+            active_modalities["macro"] = float(feat_obj.impact_score)
+            # Treat large macro surprises as "events" modality
+            if (getattr(feat_obj, "surprise", None) is not None
+                    and abs(feat_obj.surprise) > 1.5):
+                self.attention.update("events", 1 - min(1.0, abs(feat_obj.surprise) / 3.0))
+                active_modalities["events"] = float(min(1.0, abs(feat_obj.surprise) / 3.0))
             if hasattr(feat_obj, "series_id"):
                 sid = feat_obj.series_id
                 val = feat_obj.value
@@ -270,7 +468,7 @@ class GMMIEEngine:
         self._last_ws = ws_dict
 
         self._last_causal = self.causal.update()
-        regime = classify_regime(ws_dict)
+        regime = self.regime_clf.classify(ws_dict)
 
         vol = feat_obj.vol_20 if hasattr(feat_obj, "vol_20") else 1.0
         self.forecaster.push(self._last_price, vol, latent)
@@ -281,14 +479,33 @@ class GMMIEEngine:
         attn_weights = self.attention.get_weights()
         similar      = self.memory.query(fused)
 
-        if self._tick_count % 100 == 0 and self._tick_count > 0:
-            self.memory.store(
-                fused,
-                label=f"tick_{self._tick_count}",
-                outcome=0.0,
-                regime=regime,
-                timestamp=event.wall_time,
-            )
+        # ── Outcome feedback loop ──
+        # Push current prediction into outcome tracker, then settle any
+        # predictions whose horizon has now elapsed.
+        if forecast:
+            # Use median log-return forecast over the fastest horizon
+            fast_h = min(forecast.keys())
+            q50_price = forecast[fast_h].get("q50", self._last_price)
+            if self._last_price > 0 and q50_price > 0:
+                pred_logret = float(np.log(q50_price / self._last_price))
+                self.outcomes.push(
+                    ref_price=self._last_price,
+                    predicted_logret=pred_logret,
+                    fused_context=fused,
+                    regime=regime,
+                    modality_signals=active_modalities,
+                    timestamp=event.wall_time,
+                )
+        # Update attention with actual market activity weight too
+        self.attention.update("market", 1.0 - float(abs(feat_obj.z_price)) / 5.0)
+
+        self.outcomes.settle(
+            current_price=self._last_price,
+            current_tick=self._tick_count + 1,    # post-increment below
+            meta=self.meta,
+            memory=self.memory,
+            attention=self.attention,
+        )
 
         latency_ms = (time.perf_counter() - t0) * 1000
         self._tick_count += 1

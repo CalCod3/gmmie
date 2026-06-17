@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.env
+
+# Data warehouse — never commit
+data/lake/
+data/cache/
+data/models/
+*.duckdb
+*.duckdb.wal
+
+# Pattern memory persistence
+data/memory.faiss
+data/memory_meta.pkl
+
+# IDE / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Build artefacts
+build/
+dist/
